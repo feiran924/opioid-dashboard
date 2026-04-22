@@ -1,0 +1,333 @@
+---
+title: "Interactive Visualizations: Opioid Mortality in Georgia Counties"
+author: "Feiran Zhang"
+date: "`r format(Sys.Date(), '%B %d, %Y')`"
+output:
+  html_document:
+    theme: flatly
+    toc: true
+    toc_float: true
+    self_contained: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+
+# Required packages
+# install.packages(c("leaflet","plotly","dplyr","sf","spdep","INLA","RColorBrewer","htmltools"))
+# install.packages("INLA", repos = c(INLA = "https://inla.r-inla-download.org/R/stable"))
+
+library(leaflet)
+library(plotly)
+library(dplyr)
+library(sf)
+library(spdep)
+library(INLA)
+library(RColorBrewer)
+library(htmltools)
+```
+
+```{r load-and-model, include=FALSE, cache=TRUE}
+# ── Load data ─────────────────────────────────────────────────────────────────
+data_path <- file.path("data", "ga_opioid_data_updated_final.rds")
+if (!file.exists(data_path)) {
+  stop("Data file not found at: ", data_path,
+       "\nPlace 'ga_opioid_data_updated_final.rds' in a 'data/' subfolder.")
+}
+ga_data <- readRDS(data_path)
+
+# ── Prepare modeling variables ────────────────────────────────────────────────
+ga_data[["Y"]]         <- ga_data[["mortality22"]]
+statewide_rate         <- sum(ga_data$mortality22, na.rm=TRUE) /
+                          sum(ga_data$population, na.rm=TRUE)
+ga_data[["E"]]         <- ga_data$population * statewide_rate
+ga_data[["county_id"]] <- seq_len(nrow(ga_data))
+ga_df <- as.data.frame(ga_data)
+
+# ── Build spatial graph ───────────────────────────────────────────────────────
+ga_nb      <- poly2nb(ga_data, queen = TRUE)
+graph_file <- tempfile(fileext = ".txt")
+nb2INLA(graph_file, ga_nb)
+ga_graph   <- inla.read.graph(graph_file)
+
+# ── Fit full BYM2 model (Uniform prior = logitbeta(1,1)) ─────────────────────
+model_full <- inla(
+  Y ~ 1 + pct_black_std + dist_to_su_std + pct_poverty_std +
+    vacancy_rate_std + unemployment_rate_std + dist_to_mh_std +
+    dist_to_otp_std + dist_to_treatment_std + dist_to_bupren_std +
+    dist_to_hrsa_std + dist_to_usroad_std +
+    f(county_id, model = "bym2", graph = ga_graph,
+      hyper = list(
+        phi  = list(prior = "logitbeta", param = c(1, 1)),
+        prec = list(prior = "pc.prec",   param = c(1, 0.01)))),
+  family            = "poisson",
+  data              = ga_df,
+  E                 = ga_df$E,
+  control.predictor = list(compute = TRUE))
+
+# ── Attach posterior RR to ga_data ────────────────────────────────────────────
+# RR_i = theta_i = fitted_count_i / E_i
+ga_data[["RR"]]       <- model_full$summary.fitted.values[["mean"]]       / ga_df$E
+ga_data[["RR_lower"]] <- model_full$summary.fitted.values[["0.025quant"]] / ga_df$E
+ga_data[["RR_upper"]] <- model_full$summary.fitted.values[["0.975quant"]] / ga_df$E
+
+# ── Back-transform standardized covariates for readable tooltips ──────────────
+# We need the original (unstandardized) values for display.
+# Unstandardized = std * SD + mean (using the sample SD/mean already in the data).
+# If raw columns exist use them directly; otherwise approximate from _std.
+# Try to use raw columns first:
+get_raw <- function(df, raw_col, std_col) {
+  if (raw_col %in% names(df)) return(df[[raw_col]])
+  # reconstruct from z-score (approximation for display only)
+  z <- df[[std_col]]
+  # We don't have the original mean/SD here, so just return NULL to use _std label
+  NULL
+}
+
+# Check if raw columns are available
+has_poverty     <- "pct_poverty"     %in% names(ga_data)
+has_unemployment<- "unemployment_rate"%in% names(ga_data)
+has_dist_su     <- "dist_to_su"      %in% names(ga_data)
+has_pct_black   <- "pct_black"       %in% names(ga_data)
+
+# Use raw if available, else use standardized (labeled accordingly)
+ga_data[["pov_display"]]    <- if (has_poverty)      ga_data[["pct_poverty"]]      else ga_data[["pct_poverty_std"]]
+ga_data[["unemp_display"]]  <- if (has_unemployment) ga_data[["unemployment_rate"]] else ga_data[["unemployment_rate_std"]]
+ga_data[["su_display"]]     <- if (has_dist_su)      ga_data[["dist_to_su"]]       else ga_data[["dist_to_su_std"]]
+ga_data[["black_display"]]  <- if (has_pct_black)    ga_data[["pct_black"]]        else ga_data[["pct_black_std"]]
+
+pov_label   <- if (has_poverty)      "Poverty Rate (%)"       else "Poverty Rate (z-score)"
+unemp_label <- if (has_unemployment) "Unemployment Rate (%)"  else "Unemployment Rate (z-score)"
+su_label    <- if (has_dist_su)      "Dist. to SU Facility (miles)" else "Dist. to SU Facility (z-score)"
+black_label <- if (has_pct_black)    "% Black Population"     else "% Black Population (z-score)"
+
+# ── Risk category for Widget 2 ────────────────────────────────────────────────
+ga_data[["risk_cat"]] <- cut(
+  ga_data$RR,
+  breaks = c(0, 0.8, 1.0, 1.25, Inf),
+  labels = c("Low (RR < 0.8)", "Below Average (0.8–1.0)",
+             "Above Average (1.0–1.25)", "High (RR > 1.25)"),
+  right  = TRUE
+)
+
+# Convert to WGS84 for leaflet
+ga_wgs84 <- st_transform(ga_data, crs = 4326)
+```
+
+---
+
+## Widget 1: Geographic Distribution of Opioid Mortality Risk
+
+**Key takeaways:** Counties with elevated opioid mortality risk (RR > 1) are not uniformly distributed across Georgia; instead, higher-risk counties appear in localized clusters, suggesting meaningful spatial patterning. The map also highlights a small number of clear high-risk counties (warmest colors) that stand out from surrounding areas, which can be prioritized for follow-up. Hover and click on any county to view the posterior RR with 95% credible interval and observed vs. expected deaths for exploratory comparison.
+
+```{r widget1-map, echo=TRUE}
+# ── Color palette for RR ──────────────────────────────────────────────────────
+pal <- colorNumeric(
+  palette = "RdYlBu",
+  domain  = c(0.4, 2.5),
+  reverse = TRUE,
+  na.color = "#808080"
+)
+
+# ── Tooltip: human-readable HTML popup ───────────────────────────────────────
+tooltip_html <- sprintf(
+  paste0(
+    "<div style='font-family:Arial; font-size:13px; min-width:200px;'>",
+    "<b style='font-size:14px;'>%s County</b><br>",
+    "<hr style='margin:4px 0;'>",
+    "<b>Posterior Relative Risk:</b> %.2f<br>",
+    "<b>95%% Credible Interval:</b> (%.2f, %.2f)<br>",
+    "<b>Observed Opioid Deaths (2022):</b> %d<br>",
+    "<b>Expected Deaths:</b> %.1f<br>",
+    "<b>%s:</b> %s<br>",
+    "<b>%s:</b> %s<br>",
+    "</div>"
+  ),
+  ga_wgs84$NAME,
+  round(ga_wgs84$RR, 2),
+  round(ga_wgs84$RR_lower, 2),
+  round(ga_wgs84$RR_upper, 2),
+  ga_wgs84$Y,
+  round(ga_wgs84$E, 1),
+  su_label,    ifelse(has_dist_su,
+                      paste0(round(ga_wgs84$su_display, 1), " miles"),
+                      paste0(round(ga_wgs84$su_display, 2), " (z)")),
+  pov_label,   ifelse(has_poverty,
+                      paste0(round(ga_wgs84$pov_display, 1), "%"),
+                      paste0(round(ga_wgs84$pov_display, 2), " (z)"))
+)
+
+# ── Build leaflet map ─────────────────────────────────────────────────────────
+leaflet(ga_wgs84,
+        options = leafletOptions(minZoom = 6)) |>
+  addProviderTiles("CartoDB.Positron") |>
+  addPolygons(
+    fillColor   = ~pal(pmin(pmax(RR, 0.4), 2.5)),
+    fillOpacity = 0.8,
+    color       = "white",
+    weight      = 0.8,
+    opacity     = 1,
+    highlight   = highlightOptions(
+      weight      = 2.5,
+      color       = "#333",
+      fillOpacity = 0.95,
+      bringToFront = TRUE
+    ),
+    label       = ~paste0(NAME, " County — RR: ", round(RR, 2)),
+    labelOptions = labelOptions(
+      style    = list("font-size" = "12px"),
+      textsize = "12px"
+    ),
+    popup = tooltip_html
+  ) |>
+  addLegend(
+    position = "bottomright",
+    pal      = pal,
+    values   = c(0.4, 2.5),
+    title    = HTML("<b>Posterior Relative<br>Risk (RR)</b><br>
+                    <span style='font-size:10px;font-weight:normal'>
+                    RR = 1: state average<br>
+                    RR > 1: elevated risk</span>"),
+    labFormat = labelFormat(digits = 1),
+    opacity   = 0.9
+  ) |>
+  addControl(
+    html = HTML(paste0(
+      "<div style='background:white; padding:8px 12px; border-radius:4px;",
+      "box-shadow:0 1px 5px rgba(0,0,0,0.3); font-family:Arial; max-width:320px;'>",
+      "<b style='font-size:14px;'>Opioid Mortality Risk — Georgia Counties (2022)</b><br>",
+      "<span style='font-size:11px; color:#555;'>",
+      "Posterior mean relative risk from full 11-variable BYM2 spatial model.<br>",
+      "RR > 1 = higher than state average. Hover for county details; click for full statistics.",
+      "</span></div>"
+    )),
+    position = "topleft"
+  )
+```
+
+---
+
+## Widget 2: Socioeconomic Context of High-Risk Counties
+
+**Key takeaways:** The relationship between poverty rate and opioid mortality risk is weak and non-linear: high-risk counties (red points, RR > 1.25) appear across a wide range of poverty levels — including counties with moderate poverty rates around 10–15% — rather than clustering only at the highest poverty end, indicating that poverty alone does not determine opioid mortality risk. Point size encodes distance to the nearest substance use treatment facility, and the largest high-risk points (farthest from treatment) are visually concentrated in the upper portion of the plot, suggesting that treatment access compounds risk beyond what poverty explains. Use the legend to isolate any risk category, hover over individual points to compare all six county-level indicators simultaneously, and zoom in on any cluster to identify specific counties for targeted follow-up.
+
+```{r widget2-scatter, echo=TRUE}
+# ── Prepare data frame for plotly (plain df, no sf geometry) ─────────────────
+plot_df <- as.data.frame(ga_data) |>
+  select(NAME, RR, RR_lower, RR_upper, Y, E,
+         pov_display, unemp_display, su_display, black_display,
+         risk_cat) |>
+  mutate(
+    RR_rounded      = round(RR, 2),
+    pov_rounded     = round(pov_display, if (has_poverty) 1 else 2),
+    unemp_rounded   = round(unemp_display, if (has_unemployment) 1 else 2),
+    su_rounded      = round(su_display, if (has_dist_su) 1 else 2),
+    black_rounded   = round(black_display, if (has_pct_black) 1 else 2),
+    # Tooltip text
+    tooltip = paste0(
+      "<b>", NAME, " County</b><br>",
+      "<b>Relative Risk:</b> ", RR_rounded,
+      " (95% CrI: ", round(RR_lower,2), "–", round(RR_upper,2), ")<br>",
+      "<b>Observed Deaths (2022):</b> ", Y, "<br>",
+      "<b>", pov_label, ":</b> ", pov_rounded,
+               if (has_poverty) "%" else " (z)", "<br>",
+      "<b>", unemp_label, ":</b> ", unemp_rounded,
+               if (has_unemployment) "%" else " (z)", "<br>",
+      "<b>", su_label, ":</b> ", su_rounded,
+               if (has_dist_su) " miles" else " (z)", "<br>",
+      "<b>", black_label, ":</b> ", black_rounded,
+               if (has_pct_black) "%" else " (z)"
+    )
+  )
+
+# ── Color palette for risk category ──────────────────────────────────────────
+risk_colors <- c(
+  "Low (RR < 0.8)"           = "#2166ac",
+  "Below Average (0.8–1.0)"  = "#74add1",
+  "Above Average (1.0–1.25)" = "#f46d43",
+  "High (RR > 1.25)"         = "#a50026"
+)
+
+# ── Build plotly scatter ──────────────────────────────────────────────────────
+x_title <- if (has_poverty) "Poverty Rate (%)" else "Poverty Rate (standardized z-score)"
+y_title <- "Posterior Mean Relative Risk (RR)"
+
+fig <- plot_ly(
+  data       = plot_df,
+  x          = ~pov_rounded,
+  y          = ~RR_rounded,
+  color      = ~risk_cat,
+  colors     = risk_colors,
+  size       = ~su_rounded,          # point size = distance to nearest SU facility
+  sizes      = c(5, 22),
+  type       = "scatter",
+  mode       = "markers",
+  marker     = list(opacity = 0.8,
+                    line = list(width = 0.5, color = "white")),
+  text       = ~tooltip,
+  hoverinfo  = "text"
+) |>
+  layout(
+    title = list(
+      text = paste0(
+        "<b>Poverty Rate vs. Opioid Mortality Risk</b><br>",
+        "<sup>Georgia Counties, 2022 — Point size = Distance to Nearest SU Treatment Facility (miles)</sup>"
+      ),
+      font = list(size = 15),
+      x    = 0.5
+    ),
+    xaxis = list(
+      title      = list(text = x_title, font = list(size = 13)),
+      tickfont   = list(size = 11),
+      gridcolor  = "#eeeeee",
+      showgrid   = TRUE,
+      zeroline   = FALSE
+    ),
+    yaxis = list(
+      title      = list(text = y_title, font = list(size = 13)),
+      tickfont   = list(size = 11),
+      gridcolor  = "#eeeeee",
+      showgrid   = TRUE
+    ),
+    # RR = 1 reference line: shapes must be at layout top level, NOT inside yaxis
+    shapes = list(list(
+      type = "line", x0 = 0, x1 = 1, xref = "paper",
+      y0 = 1, y1 = 1,
+      line = list(color = "#888888", width = 1.2, dash = "dash")
+    )),
+    legend = list(
+      title    = list(text = "<b>Risk Category</b>",
+                      font = list(size = 12)),
+      font     = list(size = 11),
+      itemclick     = "toggleothers",
+      itemdoubleclick = "toggle"
+    ),
+    hoverlabel = list(
+      bgcolor   = "white",
+      font      = list(size = 12),
+      bordercolor = "#cccccc"
+    ),
+    annotations = list(list(
+      text      = "Dashed line = state average (RR = 1). Point size = distance to nearest SU facility (miles). Click legend to filter.",
+      xref      = "paper", yref  = "paper",
+      x = 0.01, y = -0.13, showarrow = FALSE,
+      font = list(size = 10, color = "#777777"),
+      align = "left"
+    )),
+    margin = list(b = 80)
+  )
+
+fig
+```
+
+---
+
+## Source Code Notes
+
+Both widgets were created in R using:
+
+- **Widget 1:** `leaflet` package — interactive choropleth map of county-level posterior mean relative risk (RR = θ̂ᵢ = fitted count / expected count) from the full 11-variable BYM2 spatial model. Interactive features: hover labels, click-to-popup tooltips (county name, RR with 95% credible interval, observed and expected deaths, distance to nearest substance use facility, poverty rate), zoom/pan, and county highlight on hover.
+
+- **Widget 2:** `plotly` package — scatter plot of poverty rate (x-axis) versus posterior mean relative risk (y-axis), colored by risk category, with point size encoding distance to the nearest substance use treatment facility (miles). Interactive features: hover tooltips showing 6 county-level statistics (county name, RR with 95% CrI, observed deaths, poverty rate, unemployment rate, distance to SU facility), legend toggle to isolate risk categories, zoom/pan, and a dashed reference line at RR = 1 (state average).
+
+- **Model:** BYM2 (Besag-York-Mollié 2) spatial model estimated via INLA with a Uniform(0,1) prior [logitbeta(1,1)] for the spatial mixing parameter φ. Full 11-variable specification including two focal variables (% Black population, distance to substance use facility) and nine confounders.
